@@ -22,10 +22,27 @@ master_ingress=$(cat cluster.yaml | egrep "^master_ingress:" | awk -F' ' '{print
 worker_ingress=$(cat cluster.yaml | egrep "^worker_ingress:" | awk -F' ' '{print $NF}')
 
 Local_Address=$(cat cluster.yaml | grep local_address | awk -F' ' '{print $NF}')
-Local_Port=$(cat cluster.yaml | grep ${Local_Address}: | head -n 1 |awk -F ':' '{print $NF}')
+# 修复1：使用 "^local_address:" 精确匹配配置行，避免误匹配注释或无关内容
+Local_Port=$(grep "^local_address:" cluster.yaml | awk '{print $NF}' | awk -F':' '{print $NF}')
 
-Get_Masters="$(ssh $Local_Address -p $Local_Port kubectl get node -o wide 2> /dev/null | egrep "master|control-plane" | awk '{print $6}')"
-Get_Workers="$(ssh $Local_Address -p $Local_Port kubectl get node -o wide 2> /dev/null | egrep -v "master|control-plane|STATUS" | awk '{print $6}')"
+# ---- 增加 SSH 连接测试 ----
+echo "正在测试与控制节点 $Local_Address:$Local_Port 的 SSH 连接..."
+if ! ssh -q -o BatchMode=yes -o ConnectTimeout=5 $Local_Address -p $Local_Port "exit" 2>/dev/null; then
+    echo "错误：无法通过 SSH 连接到 $Local_Address:$Local_Port，请检查网络和认证配置。" >&2
+    exit 1
+fi
+echo "SSH 连接成功。"
+# -------------------------
+
+# 获取集群节点列表（增加错误检查）
+Get_Masters="$(ssh $Local_Address -p $Local_Port kubectl get node -o wide 2> /dev/null | egrep "master|control-plane" | awk '{print $6}')" || {
+    echo "错误：获取 master 节点列表失败，请检查 kubectl 是否可用。" >&2
+    exit 1
+}
+Get_Workers="$(ssh $Local_Address -p $Local_Port kubectl get node -o wide 2> /dev/null | egrep -v "master|control-plane|STATUS" | awk '{print $6}')" || {
+    echo "错误：获取 worker 节点列表失败。" >&2
+    exit 1
+}
 Get_All_Nodes="
 $Get_Masters
 $Get_Workers
@@ -159,7 +176,8 @@ update_hosts(){
     echo "" >> hosts/ansible-hosts-up
 
     # 新增 local_host 组，供 delegate_to 查找 local_address 的 ansible_port
-    local_addr_port=$(cat cluster.yaml | grep "${Local_Address}:" | head -1 | awk -F':' '{print $NF}')
+    # 修复2：同样使用 "^local_address:" 精确匹配
+    local_addr_port=$(grep "^local_address:" cluster.yaml | awk '{print $NF}' | awk -F':' '{print $NF}')
     if [ -n "$local_addr_port" ]; then
         echo "[local_host]" >> hosts/ansible-hosts-up
         echo "$Local_Address ansible_port=$local_addr_port" >> hosts/ansible-hosts-up
@@ -206,7 +224,7 @@ if [[ $1 == "reset" ]]; then
     # 检查每个节点是否在集群中
     for i in $All_Nodes; do
         if [[ "$i" != "$Local_Address" ]];then
-            if echo "$Get_All_Nodes" | grep -q "$i"; then
+            if echo "$Get_All_Nodes" | grep -q -w "$i"; then
                 Joined_Nodes="$Joined_Nodes $i"
                 echo "✓ $i 已在集群中"
             else
@@ -240,7 +258,7 @@ if [[ $1 == "reset" ]]; then
     if [[ -n "$Joined_Nodes" ]]; then
         echo "====== 开始删除已加入集群的节点 ======"
         for i in $Joined_Nodes; do
-            Node_name=$(ssh $Local_Address -p $Local_Port kubectl get node -o wide | grep $i | awk '{print $1}')
+            Node_name=$(ssh $Local_Address -p $Local_Port kubectl get node -o wide | grep -w $i | awk '{print $1}')
             echo "== $i ($Node_name) 删除中......"
             ssh $Local_Address -p $Local_Port kubectl delete node $Node_name && echo "== $Node_name ($i) - 节点已从集群中删除" || { echo "== $i - kubectl delete 执行失败，请检查！"; exit 1; }
             echo ""
@@ -251,7 +269,7 @@ if [[ $1 == "reset" ]]; then
     
     # 生成卸载用的hosts文件（包含所有节点，除了本地节点）
     echo "====== 生成卸载配置文件 ======"
-    delete_hosts "$(echo "$All_Nodes_Port" | grep -v $Local_Address)"
+    delete_hosts "$(echo "$All_Nodes_Port" | grep -v -w $Local_Address)"
     
     # 执行卸载rke2（卸载所有节点，包括未加入集群的）
     echo "====== 开始卸载所有节点的rke2 ======"
@@ -399,7 +417,7 @@ elif echo "$New_Nodes" | egrep -q '([0-9]{1,3}\.){3}[0-9]{1,3}' || echo "$Del_No
         echo "====== 删除节点 ======"
         delete_hosts "$Del_Nodes_Port"
         for i in $Del_Nodes; do
-            Node_name=$(ssh $Local_Address -p $Local_Port kubectl get node -o wide | grep $i | awk '{print $1}')
+            Node_name=$(ssh $Local_Address -p $Local_Port kubectl get node -o wide | grep -w $i | awk '{print $1}')
             echo "== $i 删除中......"
             echo "== kubectl delete node $Node_name ......"
             ssh $Local_Address -p $Local_Port kubectl delete node $Node_name && echo "== ${Node_name}/$i - 节点已从集群中删除" || { echo "== $i - kubectl delete 执行失败，请检查！"; exit 1; }
